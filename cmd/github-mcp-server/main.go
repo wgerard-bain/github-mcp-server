@@ -27,6 +27,54 @@ var (
 		Version: fmt.Sprintf("Version: %s\nCommit: %s\nBuild Date: %s", version, commit, date),
 	}
 
+	httpCmd = &cobra.Command{
+		Use:   "http",
+		Short: "Start HTTP server",
+		Long:  `Start a server that communicates via HTTP, allowing multiple clients to connect concurrently. Each client can provide their own GitHub token via the Authorization header.`,
+		RunE: func(_ *cobra.Command, _ []string) error {
+			token := viper.GetString("personal_access_token")
+			// Token is optional in HTTP mode - clients can provide their own via Authorization header
+
+			var enabledToolsets []string
+			if viper.IsSet("toolsets") {
+				if err := viper.UnmarshalKey("toolsets", &enabledToolsets); err != nil {
+					return fmt.Errorf("failed to unmarshal toolsets: %w", err)
+				}
+			}
+
+			var enabledTools []string
+			if viper.IsSet("tools") {
+				if err := viper.UnmarshalKey("tools", &enabledTools); err != nil {
+					return fmt.Errorf("failed to unmarshal tools: %w", err)
+				}
+			}
+
+			var enabledFeatures []string
+			if viper.IsSet("features") {
+				if err := viper.UnmarshalKey("features", &enabledFeatures); err != nil {
+					return fmt.Errorf("failed to unmarshal features: %w", err)
+				}
+			}
+
+			httpServerConfig := ghmcp.HTTPServerConfig{
+				Version:              version,
+				Host:                 viper.GetString("host"),
+				Token:                token,
+				EnabledToolsets:      enabledToolsets,
+				EnabledTools:         enabledTools,
+				EnabledFeatures:      enabledFeatures,
+				DynamicToolsets:      viper.GetBool("dynamic_toolsets"),
+				ReadOnly:             viper.GetBool("read-only"),
+				ExportTranslations:   viper.GetBool("export-translations"),
+				EnableCommandLogging: viper.GetBool("enable-command-logging"),
+				LogFilePath:          viper.GetString("log-file"),
+				ContentWindowSize:    viper.GetInt("content-window-size"),
+				Port:                 viper.GetInt("port"),
+			}
+			return ghmcp.RunHTTPServer(httpServerConfig)
+		},
+	}
+
 	stdioCmd = &cobra.Command{
 		Use:   "stdio",
 		Short: "Start stdio server",
@@ -129,6 +177,11 @@ func init() {
 
 	// Add subcommands
 	rootCmd.AddCommand(stdioCmd)
+	rootCmd.AddCommand(httpCmd)
+
+	// HTTP-specific flags
+	httpCmd.Flags().Int("port", 8080, "Port to listen on for HTTP server")
+	_ = viper.BindPFlag("port", httpCmd.Flags().Lookup("port"))
 }
 
 func initConfig() {

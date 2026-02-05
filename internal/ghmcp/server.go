@@ -26,6 +26,9 @@ import (
 	"github.com/shurcooL/githubv4"
 )
 
+// githubTokenKey is used to store per-request GitHub tokens in context
+type githubTokenKey struct{}
+
 type MCPServerConfig struct {
 	// Version of the server
 	Version string
@@ -76,6 +79,10 @@ type MCPServerConfig struct {
 	// When non-nil, tools requiring scopes not in this list will be hidden.
 	// This is used for PAT scope filtering where we can't issue scope challenges.
 	TokenScopes []string
+
+	// SkipDepsInjection skips the default dependency injection middleware.
+	// Use this for HTTP mode where deps are injected per-request with different tokens.
+	SkipDepsInjection bool
 }
 
 // githubClients holds all the GitHub API clients created for a server instance.
@@ -234,11 +241,14 @@ func NewMCPServer(cfg MCPServerConfig) (*mcp.Server, error) {
 	)
 
 	// Inject dependencies into context for all tool handlers
-	ghServer.AddReceivingMiddleware(func(next mcp.MethodHandler) mcp.MethodHandler {
-		return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
-			return next(github.ContextWithDeps(ctx, deps), method, req)
-		}
-	})
+	// Skip this for HTTP mode where deps are injected per-request with different tokens
+	if !cfg.SkipDepsInjection {
+		ghServer.AddReceivingMiddleware(func(next mcp.MethodHandler) mcp.MethodHandler {
+			return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
+				return next(github.ContextWithDeps(ctx, deps), method, req)
+			}
+		})
+	}
 
 	if unrecognized := inventory.UnrecognizedToolsets(); len(unrecognized) > 0 {
 		fmt.Fprintf(os.Stderr, "Warning: unrecognized toolsets ignored: %s\n", strings.Join(unrecognized, ", "))
@@ -336,6 +346,230 @@ type StdioServerConfig struct {
 
 	// RepoAccessCacheTTL overrides the default TTL for repository access cache entries.
 	RepoAccessCacheTTL *time.Duration
+}
+
+// HTTPServerConfig contains configuration for running the MCP server in HTTP mode.
+// HTTP mode allows multiple clients to connect concurrently, each with their own
+// GitHub token provided via the Authorization header.
+type HTTPServerConfig struct {
+	// Version of the server
+	Version string
+
+	// GitHub Host to target for API requests (e.g. github.com or github.enterprise.com)
+	Host string
+
+	// GitHub Token to authenticate with the GitHub API (fallback when no Authorization header)
+	Token string
+
+	// EnabledToolsets is a list of toolsets to enable
+	EnabledToolsets []string
+
+	// EnabledTools is a list of specific tools to enable (additive to toolsets)
+	EnabledTools []string
+
+	// EnabledFeatures is a list of feature flags that are enabled
+	EnabledFeatures []string
+
+	// Whether to enable dynamic toolsets
+	DynamicToolsets bool
+
+	// ReadOnly indicates if we should only register read-only tools
+	ReadOnly bool
+
+	// ExportTranslations indicates if we should export translations
+	ExportTranslations bool
+
+	// EnableCommandLogging indicates if we should log commands
+	EnableCommandLogging bool
+
+	// Path to the log file if not stderr
+	LogFilePath string
+
+	// Content window size
+	ContentWindowSize int
+
+	// Port to listen on for HTTP server
+	Port int
+}
+
+// RunHTTPServer starts the MCP server in HTTP mode, allowing multiple clients to connect
+// concurrently. Each client can provide their own GitHub token via the Authorization header.
+// If no Authorization header is provided, the server falls back to the Token from config.
+func RunHTTPServer(cfg HTTPServerConfig) error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	t, dumpTranslations := translations.TranslationHelper()
+
+	var slogHandler slog.Handler
+	var logOutput io.Writer
+	if cfg.LogFilePath != "" {
+		file, err := os.OpenFile(cfg.LogFilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+		if err != nil {
+			return fmt.Errorf("failed to open log file: %w", err)
+		}
+		logOutput = file
+		slogHandler = slog.NewTextHandler(logOutput, &slog.HandlerOptions{Level: slog.LevelDebug})
+	} else {
+		logOutput = os.Stderr
+		slogHandler = slog.NewTextHandler(logOutput, &slog.HandlerOptions{Level: slog.LevelInfo})
+	}
+	logger := slog.New(slogHandler)
+	logger.Info("starting HTTP server", "version", cfg.Version, "host", cfg.Host, "port", cfg.Port, "dynamicToolsets", cfg.DynamicToolsets, "readOnly", cfg.ReadOnly)
+
+	// Parse API host once for reuse in per-request client creation
+	apiHost, err := parseAPIHost(cfg.Host)
+	if err != nil {
+		return fmt.Errorf("failed to parse API host: %w", err)
+	}
+
+	// Create server config - token may be empty if all clients provide their own
+	// SkipDepsInjection=true means deps are injected per-request by our middleware
+	ghServer, err := NewMCPServer(MCPServerConfig{
+		Version:           cfg.Version,
+		Host:              cfg.Host,
+		Token:             cfg.Token,
+		EnabledToolsets:   cfg.EnabledToolsets,
+		EnabledTools:      cfg.EnabledTools,
+		EnabledFeatures:   cfg.EnabledFeatures,
+		DynamicToolsets:   cfg.DynamicToolsets,
+		ReadOnly:          cfg.ReadOnly,
+		Translator:        t,
+		ContentWindowSize: cfg.ContentWindowSize,
+		Logger:            logger,
+		SkipDepsInjection: true,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create MCP server: %w", err)
+	}
+
+	// Add middleware to extract token from Authorization header and create per-request deps
+	ghServer.AddReceivingMiddleware(createPerRequestDepsMiddleware(cfg, apiHost, t, logger))
+
+	if cfg.ExportTranslations {
+		dumpTranslations()
+	}
+
+	// Create HTTP handler using StreamableHTTPHandler
+	mcpHandler := mcp.NewStreamableHTTPHandler(
+		func(r *http.Request) *mcp.Server {
+			return ghServer
+		},
+		&mcp.StreamableHTTPOptions{
+			Logger: logger,
+		},
+	)
+
+	// Wrap with middleware to extract token from Authorization header
+	httpHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := extractTokenFromAuthHeader(r.Context(), r)
+		mcpHandler.ServeHTTP(w, r.WithContext(ctx))
+	})
+
+	addr := fmt.Sprintf(":%d", cfg.Port)
+	srv := &http.Server{
+		Addr:    addr,
+		Handler: httpHandler,
+	}
+
+	_, _ = fmt.Fprintf(os.Stderr, "GitHub MCP Server running on HTTP at %s\n", addr)
+
+	errC := make(chan error, 1)
+	go func() {
+		errC <- srv.ListenAndServe()
+	}()
+
+	select {
+	case <-ctx.Done():
+		logger.Info("shutting down server")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		return srv.Shutdown(shutdownCtx)
+	case err := <-errC:
+		if err != nil && err != http.ErrServerClosed {
+			return fmt.Errorf("error running server: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// extractTokenFromAuthHeader extracts the Bearer token from the Authorization header
+// and stores it in the context for use by the per-request deps middleware.
+func extractTokenFromAuthHeader(ctx context.Context, r *http.Request) context.Context {
+	authHeader := r.Header.Get("Authorization")
+	if authHeader != "" && strings.HasPrefix(authHeader, "Bearer ") {
+		token := strings.TrimPrefix(authHeader, "Bearer ")
+		return context.WithValue(ctx, githubTokenKey{}, token)
+	}
+	return ctx
+}
+
+// createPerRequestDepsMiddleware creates a middleware that builds GitHub clients
+// based on the token from the request context (extracted from Authorization header).
+func createPerRequestDepsMiddleware(cfg HTTPServerConfig, apiHost apiHost, t translations.TranslationHelperFunc, logger *slog.Logger) func(next mcp.MethodHandler) mcp.MethodHandler {
+	// Create feature checker once
+	featureChecker := createFeatureChecker(cfg.EnabledFeatures)
+
+	return func(next mcp.MethodHandler) mcp.MethodHandler {
+		return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
+			// Get token from context (set by extractTokenFromAuthHeader) or fall back to config
+			token := cfg.Token
+			if tokenVal := ctx.Value(githubTokenKey{}); tokenVal != nil {
+				if tkn, ok := tokenVal.(string); ok && tkn != "" {
+					token = tkn
+				}
+			}
+
+			// Methods that require GitHub API access need a token
+			// Return an error for these methods if no token is provided
+			if token == "" {
+				switch method {
+				case "tools/call", "resources/read", "resources/subscribe":
+					return nil, fmt.Errorf("no GitHub token provided: set GITHUB_PERSONAL_ACCESS_TOKEN or provide Authorization header")
+				}
+				// For other methods (initialize, tools/list, etc.), proceed without deps
+				// These methods don't actually need GitHub API access
+				return next(ctx, method, req)
+			}
+
+			// Create REST client for this request
+			restClient := gogithub.NewClient(nil).WithAuthToken(token)
+			restClient.UserAgent = fmt.Sprintf("github-mcp-server/%s", cfg.Version)
+			restClient.BaseURL = apiHost.baseRESTURL
+			restClient.UploadURL = apiHost.uploadURL
+
+			// Create GraphQL client for this request
+			gqlHTTPClient := &http.Client{
+				Transport: &bearerAuthTransport{
+					transport: &github.GraphQLFeaturesTransport{
+						Transport: http.DefaultTransport,
+					},
+					token: token,
+				},
+			}
+			gqlClient := githubv4.NewEnterpriseClient(apiHost.graphqlURL.String(), gqlHTTPClient)
+
+			// Create raw content client
+			rawClient := raw.NewClient(restClient, apiHost.rawURL)
+
+			// Build deps for this request
+			deps := github.NewBaseDeps(
+				restClient,
+				gqlClient,
+				rawClient,
+				nil, // No lockdown mode in HTTP for simplicity
+				t,
+				github.FeatureFlags{},
+				cfg.ContentWindowSize,
+				featureChecker,
+			)
+
+			// Inject deps into context and continue
+			ctx = github.ContextWithDeps(ctx, deps)
+			return next(ctx, method, req)
+		}
+	}
 }
 
 // RunStdioServer is not concurrent safe.
